@@ -1,0 +1,727 @@
+-- OPTIMIZED AIM ASSIST FOR PRISON LIFE (💢 & CRIMINALS)
+-- Place in StarterPlayerScripts as LocalScript
+-- Performance Optimized: Cached variables, efficient loops, minimal allocations
+
+print("Loading Optimized Prison Life Aim Assist...")
+
+-- OPTIMIZATION: Cache services once at startup
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Teams = game:GetService("Teams")
+local Workspace = game:GetService("Workspace")
+
+-- OPTIMIZATION: Cache local player and camera
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+local playerGui = player:WaitForChild("PlayerGui", 10)
+if not playerGui then
+    error("PlayerGui failed to load")
+    return
+end
+
+-- Configuration (local variables for faster access)
+local aimAssistEnabled = false
+local wallCheckEnabled = true
+local fovRadius = 200
+local minFovRadius = 100
+local maxFovRadius = 500
+local predictionStrength = 0.5
+local minPredictionStrength = 0.0
+local maxPredictionStrength = 2.0
+local predictionStep = 0.25
+local bulletSpeed = 3000
+local minBulletSpeed = 1000
+local maxBulletSpeed = 5000
+local bulletSpeedStep = 500
+local smoothness = 0.25
+local minSmoothness = 0.10
+local maxSmoothness = 0.50
+local smoothnessStep = 0.05
+local reactionTime = 0.17
+local aimPart = "Head"
+local targetInmatesOnly = true
+local targetCriminals = true
+
+-- OPTIMIZATION: Pre-calculate commonly used values
+local CRIMINAL_TEAM_NAME = "Criminals"
+local INMATE_MARKER = "💢"
+
+-- FIX: Checks Name, DisplayName, and team fallback for inmate detection
+local function isInmate(p)
+    local name = p.Name or ""
+    local display = p.DisplayName or ""
+    if name:find(INMATE_MARKER, 1, true) or display:find(INMATE_MARKER, 1, true) then
+        return true
+    end
+    if p.Team and (p.Team.Name == "Prisoners" or p.Team.Name == "Inmates") then
+        return true
+    end
+    return false
+end
+
+-- Weapon Presets (frozen table for memory efficiency)
+local weaponPresets = {
+    {name = "M9 (Pistol)", speed = 2500, smooth = 0.28, pred = 0.4, fov = 180, desc = "Standard Guard pistol\nMedium range, semi-auto"},
+    {name = "AK-47", speed = 3200, smooth = 0.22, pred = 0.6, fov = 200, desc = "High damage rifle\nFull auto, high recoil"},
+    {name = "Remington 870", speed = 1500, smooth = 0.35, pred = 0.2, fov = 250, desc = "Pump shotgun\nClose range, high spread"},
+    {name = "M4A1", speed = 3500, smooth = 0.20, pred = 0.7, fov = 190, desc = "Guard assault rifle\nFull auto, accurate"},
+    {name = "Sniper", speed = 4000, smooth = 0.15, pred = 0.8, fov = 150, desc = "Long range rifle\nHigh damage, slow fire rate"},
+    {name = "Taser", speed = 2000, smooth = 0.30, pred = 0.3, fov = 200, desc = "Non-lethal stun weapon\nShort range projectile"}
+}
+
+-- GUI Cleanup
+local existingGui = playerGui:FindFirstChild("PrisonLifeAimGUI")
+if existingGui then
+    existingGui:Destroy()
+    task.wait(0.1)
+end
+
+-- OPTIMIZATION: Reusable Color3 values
+local COLOR_ORANGE = Color3.fromRGB(255, 140, 0)
+local COLOR_BLACK = Color3.fromRGB(0, 0, 0)
+local COLOR_RED = Color3.fromRGB(200, 50, 50)
+local COLOR_GREEN = Color3.fromRGB(50, 200, 50)
+local COLOR_DARK_BG = Color3.fromRGB(40, 40, 45)
+local COLOR_DARKER_BG = Color3.fromRGB(30, 30, 30)
+local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
+
+-- Create ScreenGui
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "PrisonLifeAimGUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+-- Main Frame
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 340, 0, 850)
+frame.Position = UDim2.new(0.02, 0, 0.08, 0)
+frame.BackgroundColor3 = COLOR_DARK_BG
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = screenGui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 12)
+frameCorner.Parent = frame
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = COLOR_ORANGE
+frameStroke.Thickness = 2
+frameStroke.Parent = frame
+
+-- Title
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 40)
+title.BackgroundColor3 = COLOR_ORANGE
+title.BorderSizePixel = 0
+title.Text = "PRISON LIFE AIM ASSIST"
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 18
+title.TextColor3 = COLOR_BLACK
+title.Parent = frame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 12)
+titleCorner.Parent = title
+
+-- Target Counters
+local inmateCounter = Instance.new("TextLabel")
+inmateCounter.Size = UDim2.new(1, -20, 0, 28)
+inmateCounter.Position = UDim2.new(0, 10, 0, 45)
+inmateCounter.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+inmateCounter.BorderSizePixel = 0
+inmateCounter.Text = "💢 Inmates: 0"
+inmateCounter.Font = Enum.Font.SourceSansBold
+inmateCounter.TextSize = 13
+inmateCounter.TextColor3 = Color3.fromRGB(255, 100, 100)
+inmateCounter.Parent = frame
+
+local inmateCorner = Instance.new("UICorner")
+inmateCorner.CornerRadius = UDim.new(0, 8)
+inmateCorner.Parent = inmateCounter
+
+local criminalCounter = Instance.new("TextLabel")
+criminalCounter.Size = UDim2.new(1, -20, 0, 28)
+criminalCounter.Position = UDim2.new(0, 10, 0, 78)
+criminalCounter.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+criminalCounter.BorderSizePixel = 0
+criminalCounter.Text = "🔴 Criminals: 0"
+criminalCounter.Font = Enum.Font.SourceSansBold
+criminalCounter.TextSize = 13
+criminalCounter.TextColor3 = COLOR_ORANGE
+criminalCounter.Parent = frame
+
+local criminalCorner = Instance.new("UICorner")
+criminalCorner.CornerRadius = UDim.new(0, 8)
+criminalCorner.Parent = criminalCounter
+
+-- OPTIMIZATION: Button creation helper with minimal object creation
+local function createButton(y, color, text, textColor)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -20, 0, 45)
+    btn.Position = UDim2.new(0, 10, 0, y)
+    btn.BackgroundColor3 = color
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 15
+    btn.TextColor3 = textColor or COLOR_WHITE
+    btn.AutoButtonColor = false
+    btn.Parent = frame
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = btn
+    
+    return btn
+end
+
+-- Control Buttons
+local aimBtn = createButton(116, COLOR_RED, "Enable Aim Assist")
+local inmateToggle = createButton(176, Color3.fromRGB(255, 100, 100), "Target 💢: ON")
+local criminalToggle = createButton(236, COLOR_ORANGE, "Target Criminals: ON", COLOR_BLACK)
+local wallBtn = createButton(296, COLOR_GREEN, "Wall Check: ON")
+local aimPartBtn = createButton(356, Color3.fromRGB(100, 150, 255), "Aim At: Head")
+local fovBtn = createButton(416, Color3.fromRGB(80, 100, 255), "FOV: " .. fovRadius)
+local speedBtn = createButton(476, Color3.fromRGB(255, 220, 0), "Speed: " .. bulletSpeed, COLOR_BLACK)
+local smoothBtn = createButton(536, Color3.fromRGB(100, 255, 150), string.format("Smooth: %.2f", smoothness), COLOR_BLACK)
+local predBtn = createButton(596, Color3.fromRGB(255, 150, 50), string.format("Pred: %.2fx", predictionStrength))
+local weaponBtn = createButton(656, COLOR_ORANGE, "Weapon Presets", COLOR_BLACK)
+local listBtn = createButton(716, Color3.fromRGB(150, 100, 200), "Show Target List")
+
+-- Target List Frame
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, -20, 0, 100)
+listFrame.Position = UDim2.new(0, 10, 0, 771)
+listFrame.BackgroundColor3 = COLOR_DARKER_BG
+listFrame.BorderSizePixel = 0
+listFrame.Visible = false
+listFrame.ScrollBarThickness = 6
+listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.Parent = frame
+
+local listCorner = Instance.new("UICorner")
+listCorner.CornerRadius = UDim.new(0, 10)
+listCorner.Parent = listFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 3)
+listLayout.Parent = listFrame
+
+-- Weapon Presets Frame
+local weaponFrame = Instance.new("ScrollingFrame")
+weaponFrame.Size = UDim2.new(0, 420, 0, 650)
+weaponFrame.Position = UDim2.new(0, 360, 0.08, 0)
+weaponFrame.BackgroundColor3 = COLOR_DARK_BG
+weaponFrame.BorderSizePixel = 0
+weaponFrame.Visible = false
+weaponFrame.ScrollBarThickness = 8
+weaponFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+weaponFrame.Active = true
+weaponFrame.Draggable = true
+weaponFrame.Parent = screenGui
+
+local weaponCorner = Instance.new("UICorner")
+weaponCorner.CornerRadius = UDim.new(0, 12)
+weaponCorner.Parent = weaponFrame
+
+local weaponStroke = Instance.new("UIStroke")
+weaponStroke.Color = COLOR_ORANGE
+weaponStroke.Thickness = 2
+weaponStroke.Parent = weaponFrame
+
+local weaponTitle = Instance.new("TextLabel")
+weaponTitle.Size = UDim2.new(1, 0, 0, 40)
+weaponTitle.BackgroundColor3 = COLOR_ORANGE
+weaponTitle.BorderSizePixel = 0
+weaponTitle.Text = "PRISON LIFE WEAPONS"
+weaponTitle.Font = Enum.Font.SourceSansBold
+weaponTitle.TextSize = 16
+weaponTitle.TextColor3 = COLOR_BLACK
+weaponTitle.Parent = weaponFrame
+
+local weaponTitleCorner = Instance.new("UICorner")
+weaponTitleCorner.CornerRadius = UDim.new(0, 12)
+weaponTitleCorner.Parent = weaponTitle
+
+local weaponLayout = Instance.new("UIListLayout")
+weaponLayout.Padding = UDim.new(0, 10)
+weaponLayout.Parent = weaponFrame
+
+local weaponPad = Instance.new("UIPadding")
+weaponPad.PaddingTop = UDim.new(0, 50)
+weaponPad.PaddingLeft = UDim.new(0, 10)
+weaponPad.PaddingRight = UDim.new(0, 10)
+weaponPad.PaddingBottom = UDim.new(0, 10)
+weaponPad.Parent = weaponFrame
+
+-- OPTIMIZATION: Cache counter colors
+local INMATE_COLOR_ACTIVE = Color3.fromRGB(255, 100, 100)
+local INMATE_COLOR_INACTIVE = Color3.fromRGB(150, 150, 150)
+local CRIMINAL_COLOR_ACTIVE = COLOR_ORANGE
+local CRIMINAL_COLOR_INACTIVE = Color3.fromRGB(150, 150, 150)
+
+-- Update Counters (optimized with cached values)
+local function updateCounters()
+    local inmateCount = 0
+    local criminalCount = 0
+    
+    local allPlayers = Players:GetPlayers()
+    for i = 1, #allPlayers do
+        local p = allPlayers[i]
+        if isInmate(p) then  -- FIX: was p.Name:find(INMATE_MARKER)
+            inmateCount = inmateCount + 1
+        end
+        if p.Team and p.Team.Name == CRIMINAL_TEAM_NAME then
+            criminalCount = criminalCount + 1
+        end
+    end
+    
+    inmateCounter.Text = "💢 Inmates: " .. inmateCount
+    inmateCounter.TextColor3 = inmateCount > 0 and INMATE_COLOR_ACTIVE or INMATE_COLOR_INACTIVE
+    
+    criminalCounter.Text = "🔴 Criminals: " .. criminalCount
+    criminalCounter.TextColor3 = criminalCount > 0 and CRIMINAL_COLOR_ACTIVE or CRIMINAL_COLOR_INACTIVE
+end
+
+-- Update Target List (optimized)
+local function updateTargetList()
+    local children = listFrame:GetChildren()
+    for i = 1, #children do
+        if children[i]:IsA("TextLabel") then
+            children[i]:Destroy()
+        end
+    end
+    
+    local targets = {}
+    local targetCount = 0
+    
+    local allPlayers = Players:GetPlayers()
+    for i = 1, #allPlayers do
+        local p = allPlayers[i]
+        local isTarget = false
+        local targetType = ""
+        
+        if targetInmatesOnly and isInmate(p) then  -- FIX: was p.Name:find(INMATE_MARKER)
+            isTarget = true
+            targetType = "💢 Inmate"
+        elseif targetCriminals and p.Team and p.Team.Name == CRIMINAL_TEAM_NAME then
+            isTarget = true
+            targetType = "🔴 Criminal"
+        end
+        
+        if isTarget then
+            targetCount = targetCount + 1
+            targets[targetCount] = {player = p, type = targetType}
+        end
+    end
+    
+    if targetCount == 0 then
+        local noTargets = Instance.new("TextLabel")
+        noTargets.Size = UDim2.new(1, -10, 0, 30)
+        noTargets.BackgroundTransparency = 1
+        noTargets.Text = "No targets found"
+        noTargets.TextColor3 = INMATE_COLOR_INACTIVE
+        noTargets.Font = Enum.Font.SourceSans
+        noTargets.TextSize = 13
+        noTargets.Parent = listFrame
+    else
+        for i = 1, targetCount do
+            local target = targets[i]
+            local entry = Instance.new("TextLabel")
+            entry.Size = UDim2.new(1, -10, 0, 25)
+            entry.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+            entry.BorderSizePixel = 0
+            entry.Text = string.format("%d. [%s] %s", i, target.type, target.player.Name)
+            entry.TextColor3 = target.type:find("💢") and INMATE_COLOR_ACTIVE or CRIMINAL_COLOR_ACTIVE
+            entry.Font = Enum.Font.SourceSans
+            entry.TextSize = 12
+            entry.TextXAlignment = Enum.TextXAlignment.Left
+            entry.Parent = listFrame
+            
+            local entryPad = Instance.new("UIPadding")
+            entryPad.PaddingLeft = UDim.new(0, 5)
+            entryPad.Parent = entry
+            
+            local entryCorner = Instance.new("UICorner")
+            entryCorner.CornerRadius = UDim.new(0, 5)
+            entryCorner.Parent = entry
+        end
+    end
+end
+
+-- Populate Weapon Presets (optimized)
+local function populateWeapons()
+    local children = weaponFrame:GetChildren()
+    for i = 1, #children do
+        if children[i]:IsA("Frame") then
+            children[i]:Destroy()
+        end
+    end
+    
+    for i = 1, #weaponPresets do
+        local weapon = weaponPresets[i]
+        
+        local card = Instance.new("Frame")
+        card.Size = UDim2.new(1, -20, 0, 120)
+        card.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+        card.BorderSizePixel = 0
+        card.LayoutOrder = i
+        card.Parent = weaponFrame
+        
+        local cardCorner = Instance.new("UICorner")
+        cardCorner.CornerRadius = UDim.new(0, 10)
+        cardCorner.Parent = card
+        
+        local cardStroke = Instance.new("UIStroke")
+        cardStroke.Color = COLOR_ORANGE
+        cardStroke.Thickness = 1
+        cardStroke.Transparency = 0.7
+        cardStroke.Parent = card
+        
+        local name = Instance.new("TextLabel")
+        name.Size = UDim2.new(1, -10, 0, 25)
+        name.Position = UDim2.new(0, 5, 0, 5)
+        name.BackgroundTransparency = 1
+        name.BorderSizePixel = 0
+        name.Text = weapon.name
+        name.Font = Enum.Font.SourceSansBold
+        name.TextSize = 16
+        name.TextColor3 = COLOR_ORANGE
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Parent = card
+        
+        local desc = Instance.new("TextLabel")
+        desc.Size = UDim2.new(1, -10, 0, 35)
+        desc.Position = UDim2.new(0, 5, 0, 30)
+        desc.BackgroundTransparency = 1
+        desc.BorderSizePixel = 0
+        desc.Text = weapon.desc
+        desc.Font = Enum.Font.SourceSans
+        desc.TextSize = 11
+        desc.TextColor3 = Color3.fromRGB(200, 200, 200)
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.TextYAlignment = Enum.TextYAlignment.Top
+        desc.TextWrapped = true
+        desc.Parent = card
+        
+        local stats = Instance.new("TextLabel")
+        stats.Size = UDim2.new(1, -10, 0, 25)
+        stats.Position = UDim2.new(0, 5, 0, 60)
+        stats.BackgroundTransparency = 1
+        stats.BorderSizePixel = 0
+        stats.Text = string.format("Speed:%d | FOV:%d | Smooth:%.2f", weapon.speed, weapon.fov, weapon.smooth)
+        stats.Font = Enum.Font.SourceSans
+        stats.TextSize = 11
+        stats.TextColor3 = Color3.fromRGB(150, 200, 255)
+        stats.TextXAlignment = Enum.TextXAlignment.Left
+        stats.Parent = card
+        
+        local apply = Instance.new("TextButton")
+        apply.Size = UDim2.new(1, -10, 0, 25)
+        apply.Position = UDim2.new(0, 5, 1, -30)
+        apply.BackgroundColor3 = COLOR_ORANGE
+        apply.BorderSizePixel = 0
+        apply.Text = "Apply"
+        apply.Font = Enum.Font.SourceSansBold
+        apply.TextSize = 13
+        apply.TextColor3 = COLOR_BLACK
+        apply.AutoButtonColor = false
+        apply.Parent = card
+        
+        local applyCorner = Instance.new("UICorner")
+        applyCorner.CornerRadius = UDim.new(0, 6)
+        applyCorner.Parent = apply
+        
+        apply.MouseButton1Click:Connect(function()
+            bulletSpeed = weapon.speed
+            smoothness = weapon.smooth
+            predictionStrength = weapon.pred
+            fovRadius = weapon.fov
+            
+            speedBtn.Text = "Speed: " .. bulletSpeed
+            smoothBtn.Text = string.format("Smooth: %.2f", smoothness)
+            predBtn.Text = string.format("Pred: %.2fx", predictionStrength)
+            fovBtn.Text = "FOV: " .. fovRadius
+            
+            apply.Text = "Done!"
+            apply.BackgroundColor3 = COLOR_GREEN
+            task.wait(1)
+            apply.Text = "Apply"
+            apply.BackgroundColor3 = COLOR_ORANGE
+        end)
+    end
+end
+
+-- Button Connections
+weaponBtn.MouseButton1Click:Connect(function()
+    weaponFrame.Visible = not weaponFrame.Visible
+    if weaponFrame.Visible then
+        populateWeapons()
+    end
+end)
+
+listBtn.MouseButton1Click:Connect(function()
+    listFrame.Visible = not listFrame.Visible
+    if listFrame.Visible then
+        updateTargetList()
+    end
+end)
+
+-- Target Toggle Buttons
+inmateToggle.MouseButton1Click:Connect(function()
+    targetInmatesOnly = not targetInmatesOnly
+    inmateToggle.Text = targetInmatesOnly and "Target 💢: ON" or "Target 💢: OFF"
+    inmateToggle.BackgroundColor3 = targetInmatesOnly and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(100, 100, 100)
+end)
+
+criminalToggle.MouseButton1Click:Connect(function()
+    targetCriminals = not targetCriminals
+    criminalToggle.Text = targetCriminals and "Target Criminals: ON" or "Target Criminals: OFF"
+    criminalToggle.BackgroundColor3 = targetCriminals and COLOR_ORANGE or Color3.fromRGB(100, 100, 100)
+end)
+
+-- Aim Part Toggle
+aimPartBtn.MouseButton1Click:Connect(function()
+    if aimPart == "Head" then
+        aimPart = "Torso"
+    elseif aimPart == "Torso" then
+        aimPart = "HumanoidRootPart"
+    else
+        aimPart = "Head"
+    end
+    aimPartBtn.Text = "Aim At: " .. aimPart
+end)
+
+-- OPTIMIZATION: Reusable raycast parameters (created once)
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- OPTIMIZATION: Cached filter table (reused, not recreated)
+local raycastFilter = {player.Character, camera}
+
+-- Line of Sight Check (optimized)
+local function hasLineOfSight(target)
+    if not wallCheckEnabled then
+        return true
+    end
+    if not target or not target.Parent then
+        return false
+    end
+    
+    raycastFilter[1] = player.Character
+    rayParams.FilterDescendantsInstances = raycastFilter
+    
+    local origin = camera.CFrame.Position
+    local direction = target.Position - origin
+    local result = Workspace:Raycast(origin, direction, rayParams)
+    
+    if not result then
+        return true
+    end
+    return result.Instance:IsDescendantOf(target.Parent)
+end
+
+-- Position Prediction (optimized)
+local function predictPosition(target)
+    if not target or not target.Parent or predictionStrength <= 0 then
+        return target and target.Position or nil
+    end
+    
+    local velocity = target.AssemblyLinearVelocity
+    if velocity.Magnitude < 1 then
+        return target.Position
+    end
+    
+    local targetPos = target.Position
+    local cameraPos = camera.CFrame.Position
+    local distance = (targetPos - cameraPos).Magnitude
+    local totalTime = (distance / bulletSpeed) + reactionTime
+    
+    return targetPos + (velocity * totalTime * predictionStrength)
+end
+
+-- OPTIMIZATION: Cached center screen (updated only when viewport changes)
+local centerScreen = Vector2.new(0, 0)
+local viewportX = 0
+local viewportY = 0
+
+local function updateCenter()
+    local viewportSize = camera.ViewportSize
+    viewportX = viewportSize.X * 0.5
+    viewportY = viewportSize.Y * 0.5
+    centerScreen = Vector2.new(viewportX, viewportY)
+end
+
+updateCenter()
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateCenter)
+
+-- OPTIMIZATION: Cached math operations
+local mathHuge = math.huge
+
+-- Find Target (heavily optimized)
+local function findTarget()
+    local closest = nil
+    local closestDist = mathHuge
+    
+    local allPlayers = Players:GetPlayers()
+    local playerCount = #allPlayers
+    
+    for i = 1, playerCount do
+        local p = allPlayers[i]
+        if p ~= player then
+            local isValidTarget = false
+            
+            if targetInmatesOnly and isInmate(p) then  -- FIX: was p.Name:find(INMATE_MARKER)
+                isValidTarget = true
+            elseif targetCriminals and p.Team and p.Team.Name == CRIMINAL_TEAM_NAME then
+                isValidTarget = true
+            end
+            
+            if isValidTarget then
+                local char = p.Character
+                if char then
+                    local targetPart = char:FindFirstChild(aimPart)
+                    if not targetPart then
+                        targetPart = char:FindFirstChild("Head")
+                    end
+                    
+                    local hum = char:FindFirstChild("Humanoid")
+                    
+                    if targetPart and hum and hum.Health > 0 then
+                        local targetPos = targetPart.Position
+                        local screenPos, onScreen = camera:WorldToViewportPoint(targetPos)
+                        
+                        if onScreen then
+                            local distFromCenterX = screenPos.X - viewportX
+                            local distFromCenterY = screenPos.Y - viewportY
+                            local distFromCenter = (distFromCenterX * distFromCenterX + distFromCenterY * distFromCenterY) ^ 0.5
+                            
+                            if distFromCenter <= fovRadius then
+                                local cameraPos = camera.CFrame.Position
+                                local distance = (targetPos - cameraPos).Magnitude
+                                
+                                if distance < closestDist and hasLineOfSight(targetPart) then
+                                    closestDist = distance
+                                    closest = targetPart
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return closest
+end
+
+-- Aim Loop Variables
+local loopRunning = false
+local lastTarget = nil
+local acquireTime = 0
+
+-- Aim Assist Loop (optimized)
+local function aimLoop()
+    if loopRunning then
+        return
+    end
+    
+    loopRunning = true
+    
+    local tickFunc = tick
+    
+    while aimAssistEnabled do
+        local target = findTarget()
+        
+        if target ~= lastTarget then
+            acquireTime = tickFunc()
+            lastTarget = target
+        end
+        
+        if target then
+            local currentTime = tickFunc()
+            if currentTime - acquireTime >= reactionTime then
+                local predictedPos = predictPosition(target)
+                if predictedPos then
+                    local cameraPos = camera.CFrame.Position
+                    local targetCFrame = CFrame.new(cameraPos, predictedPos)
+                    camera.CFrame = camera.CFrame:Lerp(targetCFrame, smoothness)
+                end
+            end
+        end
+        
+        RunService.RenderStepped:Wait()
+    end
+    
+    loopRunning = false
+end
+
+-- Event Handlers
+aimBtn.MouseButton1Click:Connect(function()
+    aimAssistEnabled = not aimAssistEnabled
+    aimBtn.Text = aimAssistEnabled and "Disable Aim Assist" or "Enable Aim Assist"
+    aimBtn.BackgroundColor3 = aimAssistEnabled and COLOR_GREEN or COLOR_RED
+    
+    if aimAssistEnabled then
+        task.spawn(aimLoop)
+    else
+        lastTarget = nil
+    end
+end)
+
+wallBtn.MouseButton1Click:Connect(function()
+    wallCheckEnabled = not wallCheckEnabled
+    wallBtn.Text = wallCheckEnabled and "Wall Check: ON" or "Wall Check: OFF"
+    wallBtn.BackgroundColor3 = wallCheckEnabled and COLOR_GREEN or COLOR_RED
+end)
+
+fovBtn.MouseButton1Click:Connect(function()
+    fovRadius = fovRadius + 50
+    if fovRadius > maxFovRadius then
+        fovRadius = minFovRadius
+    end
+    fovBtn.Text = "FOV: " .. fovRadius
+end)
+
+speedBtn.MouseButton1Click:Connect(function()
+    bulletSpeed = bulletSpeed + bulletSpeedStep
+    if bulletSpeed > maxBulletSpeed then
+        bulletSpeed = minBulletSpeed
+    end
+    speedBtn.Text = "Speed: " .. bulletSpeed
+end)
+
+smoothBtn.MouseButton1Click:Connect(function()
+    smoothness = smoothness + smoothnessStep
+    if smoothness > maxSmoothness then
+        smoothness = minSmoothness
+    end
+    smoothBtn.Text = string.format("Smooth: %.2f", smoothness)
+end)
+
+predBtn.MouseButton1Click:Connect(function()
+    predictionStrength = predictionStrength + predictionStep
+    if predictionStrength > maxPredictionStrength then
+        predictionStrength = minPredictionStrength
+    end
+    predBtn.Text = string.format("Pred: %.2fx", predictionStrength)
+end)
+
+-- OPTIMIZATION: Use task.spawn for background tasks
+task.spawn(function()
+    while task.wait(2) do
+        updateCounters()
+        if listFrame.Visible then
+            updateTargetList()
+        end
+    end
+end)
+
+-- Player tracking
+Players.PlayerAdded:Connect(updateCounters)
+Players.PlayerRemoving:Connect(updateCounters)
+
+print("✅ Optimized Prison Life Aim Assist Ready!")
