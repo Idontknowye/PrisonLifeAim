@@ -50,10 +50,10 @@ if not playerGui then error("PlayerGui failed to load") return end
 -- ════════════════════════════════════════════
 local aimAssistEnabled   = false
 local wallCheckEnabled   = true
-local fovRadius          = 200
-local fovRadiusSq        = 200 * 200  -- squared: avoids sqrt in hot path
-local minFovRadius       = 100
-local maxFovRadius       = 500
+local fovRadius          = 80
+local fovRadiusSq        = 80 * 80    -- squared: avoids sqrt in hot path
+local minFovRadius       = 40
+local maxFovRadius       = 300
 local predictionStrength = 0.5
 local minPrediction      = 0.0
 local maxPrediction      = 2.0
@@ -69,6 +69,8 @@ local maxSmoothness      = 0.50
 local smoothStep         = 0.05
 local reactionTime       = 0.17
 local aimPart            = "Head"
+local aimDistMax         = 120        -- studs; default matches M9 preset
+local aimDistMaxSq       = 120 * 120  -- squared to avoid sqrt in hot path
 
 -- Selected teams: teamName → true (nil = not selected)
 local selectedTeams = {}
@@ -79,13 +81,87 @@ local KNOWN_TEAMS = {
     { name = "Guards",    color = newColor3(100, 160, 255) },
 }
 
+--[[
+  FOV = screen-pixel radius for aim lock circle.
+  Tuned per weapon's realistic engagement range in Prison Life:
+    • Close range  (Shotgun, Taser)  → wide  FOV (enemy fills screen fast)
+    • Medium range (Pistol, SMG)     → mid   FOV
+    • Long range   (Rifle, Sniper)   → tight FOV (precision only)
+
+  aimDist = max world-unit distance this weapon should lock at.
+    Prison Life studs ≈ real metres.  Calibrated to each weapon's
+    actual damage fall-off / effective range in the game.
+--]]
 local weaponPresets = {
-    { name = "M9 (Pistol)",   speed = 2500, smooth = 0.28, pred = 0.4, fov = 180, desc = "Standard Guard pistol\nMedium range, semi-auto" },
-    { name = "AK-47",         speed = 3200, smooth = 0.22, pred = 0.6, fov = 200, desc = "High damage rifle\nFull auto, high recoil"       },
-    { name = "Remington 870", speed = 1500, smooth = 0.35, pred = 0.2, fov = 250, desc = "Pump shotgun\nClose range, high spread"          },
-    { name = "M4A1",          speed = 3500, smooth = 0.20, pred = 0.7, fov = 190, desc = "Guard assault rifle\nFull auto, accurate"        },
-    { name = "Sniper",        speed = 4000, smooth = 0.15, pred = 0.8, fov = 150, desc = "Long range rifle\nHigh damage, slow fire rate"   },
-    { name = "Taser",         speed = 2000, smooth = 0.30, pred = 0.3, fov = 200, desc = "Non-lethal stun weapon\nShort range projectile"  },
+    -- ── SIDEARMS ────────────────────────────────────────────────
+    {
+        name     = "M9 (Pistol)",
+        speed    = 2400,
+        smooth   = 0.26,
+        pred     = 0.35,
+        fov      = 90,       -- medium engagement: ~25–40 studs
+        aimDist  = 120,      -- studs; past this, pistol loses accuracy
+        desc     = "Guard sidearm — semi-auto\nEffective to ~40 studs",
+    },
+    -- ── SHOTGUNS ────────────────────────────────────────────────
+    {
+        name     = "Remington 870",
+        speed    = 1400,
+        smooth   = 0.38,
+        pred     = 0.15,
+        fov      = 150,      -- wide: shotgun is only useful ≤15 studs
+        aimDist  = 55,       -- studs; buckshot falls off hard past this
+        desc     = "Pump shotgun — close range only\nEffective to ~15 studs",
+    },
+    -- ── ASSAULT RIFLES ──────────────────────────────────────────
+    {
+        name     = "AK-47",
+        speed    = 3000,
+        smooth   = 0.22,
+        pred     = 0.55,
+        fov      = 75,       -- medium-long; full auto needs tighter lock
+        aimDist  = 280,      -- studs; high dmg but drifts at range
+        desc     = "Criminal AK — full auto, high recoil\nEffective to ~80 studs",
+    },
+    {
+        name     = "M4A1",
+        speed    = 3400,
+        smooth   = 0.18,
+        pred     = 0.65,
+        fov      = 65,       -- tighter: M4 is accurate at longer range
+        aimDist  = 340,      -- studs; guard rifle, more stable
+        desc     = "Guard assault rifle — full auto\nEffective to ~100 studs",
+    },
+    -- ── MARKSMAN / SNIPER ───────────────────────────────────────
+    {
+        name     = "Sniper (Remington 700)",
+        speed    = 5000,
+        smooth   = 0.12,
+        pred     = 0.90,
+        fov      = 40,       -- very tight: any wider snaps to wrong target
+        aimDist  = 800,      -- studs; bolt-action, 1-shot headshot range
+        desc     = "Bolt-action sniper — slow fire\nEffective to ~250 studs",
+    },
+    -- ── LESS-LETHAL ─────────────────────────────────────────────
+    {
+        name     = "Taser",
+        speed    = 1200,
+        smooth   = 0.40,
+        pred     = 0.20,
+        fov      = 160,      -- very wide: taser is a point-blank tool
+        aimDist  = 40,       -- studs; taser prongs drop quickly
+        desc     = "Non-lethal — stuns target\nEffective to ~12 studs",
+    },
+    -- ── SMG ─────────────────────────────────────────────────────
+    {
+        name     = "Micro SMG (Uzi)",
+        speed    = 2800,
+        smooth   = 0.30,
+        pred     = 0.45,
+        fov      = 110,      -- mid-wide: fast fire rate, short-medium range
+        aimDist  = 160,      -- studs; high RoF but low accuracy at distance
+        desc     = "Criminal SMG — full auto, fast fire\nEffective to ~35 studs",
+    },
 }
 
 -- ════════════════════════════════════════════
@@ -672,7 +748,7 @@ local function populateWeapons()
     for i = 1, #WP do
         local w = WP[i]
         local card = newInst("Frame")
-        card.Size             = newUDim2(1,-20,0,120)
+        card.Size             = newUDim2(1,-20,0,140)
         card.BackgroundColor3 = C_CARD
         card.BorderSizePixel  = 0
         card.LayoutOrder      = i
@@ -694,13 +770,23 @@ local function populateWeapons()
             l.TextWrapped        = true
             l.Parent             = card
         end
-        mkL(w.name, 5, 5,  390, 25, 16, C_ORANGE,                      true)
-        mkL(w.desc, 5, 30, 390, 35, 11, newColor3(200,200,200),         false)
-        mkL(strFmt("Speed:%d | FOV:%d | Smooth:%.2f", w.speed, w.fov, w.smooth),
-            5, 60, 390, 25, 11, newColor3(150,200,255), false)
+
+        -- Row 1: weapon name
+        mkL(w.name, 5, 5, 390, 22, 16, C_ORANGE, true)
+        -- Row 2: description
+        mkL(w.desc, 5, 27, 390, 28, 11, newColor3(200,200,200), false)
+        -- Row 3: speed / fov / smooth
+        mkL(strFmt("Speed: %d  |  FOV: %dpx  |  Smooth: %.2f", w.speed, w.fov, w.smooth),
+            5, 56, 390, 18, 11, newColor3(150,200,255), false)
+        -- Row 4: aim lock distance — golden highlight, most important value
+        mkL(strFmt("✦ Aim Distance: %d studs  (~%dm real range)", w.aimDist, math.floor(w.aimDist * 0.28)),
+            5, 75, 390, 20, 12, newColor3(255, 210, 60), true)
+        -- Row 5: prediction mult
+        mkL(strFmt("Prediction: %.2fx",  w.pred),
+            5, 95, 390, 16, 11, newColor3(160,160,160), false)
 
         local apply = newInst("TextButton")
-        apply.Size             = newUDim2(1,-10,0,25)
+        apply.Size             = newUDim2(1,-10,0,26)
         apply.Position         = newUDim2(0,5,1,-30)
         apply.BackgroundColor3 = C_ORANGE
         apply.BorderSizePixel  = 0
@@ -712,22 +798,24 @@ local function populateWeapons()
         apply.Parent           = card
         addCorner(apply, 6)
 
-        -- Capture weapon values to avoid re-indexing w inside callback
-        local wSpeed, wSmooth, wPred, wFov = w.speed, w.smooth, w.pred, w.fov
+        -- Capture upvalues — avoids re-indexing table inside callback
+        local wSpeed, wSmooth, wPred, wFov, wDist = w.speed, w.smooth, w.pred, w.fov, w.aimDist
         apply.MouseButton1Click:Connect(function()
             bulletSpeed        = wSpeed
             smoothness         = wSmooth
             predictionStrength = wPred
             fovRadius          = wFov
-            fovRadiusSq        = wFov * wFov
-            invBulletSpeed     = 1 / wSpeed
+            fovRadiusSq        = wFov * wFov      -- keep squared cache in sync
+            invBulletSpeed     = 1 / wSpeed        -- keep inverse cache in sync
+            aimDistMax         = wDist             -- enforce weapon range limit
+            aimDistMaxSq       = wDist * wDist
             speedVal.Text      = toStr(wSpeed)
             smoothVal.Text     = strFmt("%.2f", wSmooth)
             predVal.Text       = strFmt("%.2fx", wPred)
             fovVal.Text        = toStr(wFov)
-            apply.Text             = "Done!"
+            apply.Text             = "✔ Applied!"
             apply.BackgroundColor3 = C_GREEN
-            taskDelay(1, function()
+            taskDelay(1.2, function()
                 apply.Text             = "Apply"
                 apply.BackgroundColor3 = C_ORANGE
             end)
@@ -786,7 +874,7 @@ aimPartCycleBtn.MouseButton1Click:Connect(function()
 end)
 
 fovCycleBtn.MouseButton1Click:Connect(function()
-    fovRadius   = fovRadius + 50
+    fovRadius   = fovRadius + 20
     if fovRadius > maxFovRadius then fovRadius = minFovRadius end
     fovRadiusSq = fovRadius * fovRadius
     fovVal.Text = toStr(fovRadius)
@@ -870,7 +958,8 @@ local function onRenderStep()
                         local wdy = part.Position.Y - camPos.Y
                         local wdz = part.Position.Z - camPos.Z
                         local distSq = wdx*wdx + wdy*wdy + wdz*wdz
-                        if distSq < closestDistSq then
+                        -- Hard distance cap: ignore targets beyond weapon's effective range
+                        if distSq <= aimDistMaxSq and distSq < closestDistSq then
                             if not wallCheckEnabled or hasLineOfSight(part) then
                                 closestDistSq = distSq
                                 closest = part
