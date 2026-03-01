@@ -889,4 +889,4 @@ Players.PlayerRemoving:Connect(function()
     refreshTeamCounter()
 end)
 
-print("✅ Optimized Prison Life Aim Assist Ready!")
+print("✅ Optimized Prison Life Aim Assist Ready!") 
