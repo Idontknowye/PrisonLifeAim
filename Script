@@ -76,7 +76,7 @@ local selectedTeams = {}
 local KNOWN_TEAMS = {
     { name = "Inmates",   color = newColor3(255, 100,  80) },
     { name = "Criminals", color = newColor3(255, 165,   0) },
-    { name = "Police",    color = newColor3(100, 160, 255) },
+    { name = "Guards",    color = newColor3(100, 160, 255) },
 }
 
 local weaponPresets = {
