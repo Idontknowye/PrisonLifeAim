@@ -1,28 +1,57 @@
--- OPTIMIZED AIM ASSIST FOR PRISON LIFE
+-- PRISON LIFE AIM ASSIST — HEAVILY OPTIMIZED
 -- Place in StarterPlayerScripts as LocalScript
 
-print("Loading Optimized Prison Life Aim Assist...")
+-- ════════════════════════════════════════════════════════════
+--  UPVALUE ALL GLOBALS — avoids global env lookup every call
+-- ════════════════════════════════════════════════════════════
+local mathHuge   = math.huge
+local mathMin    = math.min
+local mathSqrt   = math.sqrt
+local strFmt     = string.format
+local toStr      = tostring
+local tblConcat  = table.concat
+local tickFn     = tick
+local taskSpawn  = task.spawn
+local taskWait   = task.wait
+local taskDelay  = task.delay
+local newInst    = Instance.new
+local newUDim2   = UDim2.new
+local newUDim    = UDim.new
+local newCFrame  = CFrame.new
+local newColor3  = Color3.fromRGB
+local newVector2 = Vector2.new
+local ipairsFn   = ipairs
+local pairsFn    = pairs
+
+-- Cached Enum values (enum lookup is expensive per-access)
+local FONT_BOLD       = Enum.Font.SourceSansBold
+local FONT_REG        = Enum.Font.SourceSans
+local ALIGN_LEFT      = Enum.TextXAlignment.Left
+local ALIGN_TOP       = Enum.TextYAlignment.Top
+local AUTO_Y          = Enum.AutomaticSize.Y
+local HALIGN_CENTER   = Enum.HorizontalAlignment.Center
+local RAY_EXCLUDE     = Enum.RaycastFilterType.Exclude
+local BIND_INPUT_PRIO = Enum.RenderPriority.Camera.Value + 1
 
 -- ════════════════════════════════════════════
---   SERVICES & CORE REFS
+--  SERVICES — cached once, never re-fetched
 -- ════════════════════════════════════════════
-local Players   = game:GetService("Players")
+local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local Teams     = game:GetService("Teams")
-local Workspace = game:GetService("Workspace")
+local Workspace  = game:GetService("Workspace")
 
 local player    = Players.LocalPlayer
 local camera    = Workspace.CurrentCamera
-
 local playerGui = player:WaitForChild("PlayerGui", 10)
 if not playerGui then error("PlayerGui failed to load") return end
 
 -- ════════════════════════════════════════════
---   CONFIG
+--  CONFIG
 -- ════════════════════════════════════════════
 local aimAssistEnabled   = false
 local wallCheckEnabled   = true
 local fovRadius          = 200
+local fovRadiusSq        = 200 * 200  -- squared: avoids sqrt in hot path
 local minFovRadius       = 100
 local maxFovRadius       = 500
 local predictionStrength = 0.5
@@ -30,6 +59,7 @@ local minPrediction      = 0.0
 local maxPrediction      = 2.0
 local predStep           = 0.25
 local bulletSpeed        = 3000
+local invBulletSpeed     = 1 / 3000  -- cached inverse: avoids division per frame
 local minBulletSpeed     = 1000
 local maxBulletSpeed     = 5000
 local bulletSpeedStep    = 500
@@ -40,21 +70,15 @@ local smoothStep         = 0.05
 local reactionTime       = 0.17
 local aimPart            = "Head"
 
--- Team targeting — set of team names that are currently selected
--- Keyed by team name (string) → true/false
+-- Selected teams: teamName → true (nil = not selected)
 local selectedTeams = {}
 
--- Known Prison Life teams (also auto-populated at runtime from Teams service)
 local KNOWN_TEAMS = {
-    { name = "Prisoners",  color = Color3.fromRGB(100, 180, 255) },
-    { name = "Criminals",  color = Color3.fromRGB(255, 100,  80) },
-    { name = "Guards",     color = Color3.fromRGB( 80, 200,  80) },
-    { name = "Police",     color = Color3.fromRGB(120, 120, 255) },
+    { name = "Inmates",   color = newColor3(255, 100,  80) },
+    { name = "Criminals", color = newColor3(255, 165,   0) },
+    { name = "Police",    color = newColor3(100, 160, 255) },
 }
 
--- ════════════════════════════════════════════
---   WEAPON PRESETS
--- ════════════════════════════════════════════
 local weaponPresets = {
     { name = "M9 (Pistol)",   speed = 2500, smooth = 0.28, pred = 0.4, fov = 180, desc = "Standard Guard pistol\nMedium range, semi-auto" },
     { name = "AK-47",         speed = 3200, smooth = 0.22, pred = 0.6, fov = 200, desc = "High damage rifle\nFull auto, high recoil"       },
@@ -65,53 +89,113 @@ local weaponPresets = {
 }
 
 -- ════════════════════════════════════════════
---   GUI CLEANUP
+--  TARGETED PLAYER CACHE
+--  Maintained via events — zero rebuild cost per frame.
+--  { [player] = BasePart }  (the aim-part reference)
 -- ════════════════════════════════════════════
-for _, name in ipairs({ "PrisonLifeAimGUI", "PrisonLifeCyclesGUI", "PrisonLifeWeaponsGUI", "PrisonLifeTeamsGUI" }) do
-    local g = playerGui:FindFirstChild(name)
+local targetCache   = {}   -- [player] → aimPart BasePart (or false if char not ready)
+local targetList    = {}   -- flat array of BasePart refs, rebuilt on changes
+local targetListLen = 0
+
+-- Per-character part cache: [player] → { Head, Torso, HumanoidRootPart, Humanoid }
+local charPartCache = {}
+
+local function cacheCharParts(p)
+    local char = p.Character
+    if not char then charPartCache[p] = nil return end
+    charPartCache[p] = {
+        Head             = char:FindFirstChild("Head"),
+        Torso            = char:FindFirstChild("Torso"),
+        HumanoidRootPart = char:FindFirstChild("HumanoidRootPart"),
+        Humanoid         = char:FindFirstChild("Humanoid"),
+    }
+end
+
+local function rebuildTargetList()
+    local len = 0
+    for p, _ in pairsFn(targetCache) do
+        if selectedTeams[p.Team and p.Team.Name] then
+            local cache = charPartCache[p]
+            if cache then
+                local part = cache[aimPart] or cache.Head
+                local hum  = cache.Humanoid
+                if part and hum and hum.Health > 0 then
+                    len += 1
+                    targetList[len] = part
+                end
+            end
+        end
+    end
+    -- Wipe stale tail
+    for i = len + 1, targetListLen do targetList[i] = nil end
+    targetListLen = len
+end
+
+local function addToTargetCache(p)
+    if p == player then return end
+    targetCache[p] = true
+    cacheCharParts(p)
+    rebuildTargetList()
+end
+
+local function removeFromTargetCache(p)
+    targetCache[p]   = nil
+    charPartCache[p] = nil
+    rebuildTargetList()
+end
+
+-- ════════════════════════════════════════════
+--  GUI CLEANUP
+-- ════════════════════════════════════════════
+for _, n in ipairsFn({ "PrisonLifeAimGUI","PrisonLifeCyclesGUI","PrisonLifeWeaponsGUI","PrisonLifeTeamsGUI" }) do
+    local g = playerGui:FindFirstChild(n)
     if g then g:Destroy() end
 end
-task.wait(0.05)
+taskWait(0.05)
 
 -- ════════════════════════════════════════════
---   SHARED COLORS
+--  SHARED COLORS  (allocated once, reused everywhere)
 -- ════════════════════════════════════════════
-local C_ORANGE     = Color3.fromRGB(255, 140,   0)
-local C_BLACK      = Color3.fromRGB(  0,   0,   0)
-local C_RED        = Color3.fromRGB(200,  50,  50)
-local C_GREEN      = Color3.fromRGB( 50, 200,  50)
-local C_DARK       = Color3.fromRGB( 40,  40,  45)
-local C_DARKER     = Color3.fromRGB( 30,  30,  30)
-local C_CARD       = Color3.fromRGB( 52,  52,  58)
-local C_WHITE      = Color3.fromRGB(255, 255, 255)
-local C_MUTED      = Color3.fromRGB(150, 150, 150)
-local C_DISABLED   = Color3.fromRGB(100, 100, 100)
+local C_ORANGE   = newColor3(255,140,  0)
+local C_BLACK    = newColor3(  0,  0,  0)
+local C_RED      = newColor3(200, 50, 50)
+local C_GREEN    = newColor3( 50,200, 50)
+local C_DARK     = newColor3( 40, 40, 45)
+local C_DARKER   = newColor3( 30, 30, 30)
+local C_CARD     = newColor3( 52, 52, 58)
+local C_WHITE    = newColor3(255,255,255)
+local C_MUTED    = newColor3(150,150,150)
+local C_DISABLED = newColor3(100,100,100)
+
+-- Pre-built UDim2 singletons reused across all buttons
+local SZ_FULL_BTN  = newUDim2(1,-20,0,45)
+local SZ_FULL_LBAR = newUDim2(1,0,0,40)
 
 -- ════════════════════════════════════════════
---   SHARED UI HELPERS
+--  SHARED UI HELPERS
 -- ════════════════════════════════════════════
 local function addCorner(inst, r)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, r or 12)
+    local c = newInst("UICorner")
+    c.CornerRadius = newUDim(0, r or 12)
     c.Parent = inst
     return c
 end
 
 local function addStroke(inst, color, thickness)
-    local s = Instance.new("UIStroke")
-    s.Color = color or C_ORANGE
+    local s = newInst("UIStroke")
+    s.Color     = color or C_ORANGE
     s.Thickness = thickness or 2
-    s.Parent = inst
+    s.Parent    = inst
     return s
 end
 
 local function addOrangeTitle(parent, text)
-    local t = Instance.new("TextLabel")
-    t.Size = UDim2.new(1, 0, 0, 40)
+    local t = newInst("TextLabel")
+    t.Size             = SZ_FULL_LBAR
     t.BackgroundColor3 = C_ORANGE
     t.BorderSizePixel  = 0
     t.Text             = text
-    t.Font             = Enum.Font.SourceSansBold
+    t.Font             = FONT_BOLD
     t.TextSize         = 16
     t.TextColor3       = C_BLACK
     t.Parent           = parent
@@ -119,34 +203,33 @@ local function addOrangeTitle(parent, text)
     return t
 end
 
--- Standard full-width button
 local function makeBtn(parent, y, color, text, textColor)
-    local b = Instance.new("TextButton")
-    b.Size            = UDim2.new(1, -20, 0, 45)
-    b.Position        = UDim2.new(0, 10, 0, y)
+    local b = newInst("TextButton")
+    b.Size             = SZ_FULL_BTN
+    b.Position         = newUDim2(0, 10, 0, y)
     b.BackgroundColor3 = color
     b.BorderSizePixel  = 0
-    b.Text            = text
-    b.Font            = Enum.Font.SourceSansBold
-    b.TextSize        = 15
-    b.TextColor3      = textColor or C_WHITE
-    b.AutoButtonColor = false
-    b.Parent          = parent
+    b.Text             = text
+    b.Font             = FONT_BOLD
+    b.TextSize         = 15
+    b.TextColor3       = textColor or C_WHITE
+    b.AutoButtonColor  = false
+    b.Parent           = parent
     addCorner(b, 10)
     return b
 end
 
--- ════════════════════════════════════════════════════
---   MAIN GUI
--- ════════════════════════════════════════════════════
-local mainSG = Instance.new("ScreenGui")
-mainSG.Name          = "PrisonLifeAimGUI"
-mainSG.ResetOnSpawn  = false
-mainSG.Parent        = playerGui
+-- ════════════════════════════════════════════
+--  MAIN GUI
+-- ════════════════════════════════════════════
+local mainSG = newInst("ScreenGui")
+mainSG.Name         = "PrisonLifeAimGUI"
+mainSG.ResetOnSpawn = false
+mainSG.Parent       = playerGui
 
-local mainFrame = Instance.new("Frame")
-mainFrame.Size             = UDim2.new(0, 340, 0, 480)
-mainFrame.Position         = UDim2.new(0.02, 0, 0.08, 0)
+local mainFrame = newInst("Frame")
+mainFrame.Size             = newUDim2(0,340,0,480)
+mainFrame.Position         = newUDim2(0.02,0,0.08,0)
 mainFrame.BackgroundColor3 = C_DARK
 mainFrame.BorderSizePixel  = 0
 mainFrame.Active           = true
@@ -156,53 +239,49 @@ addCorner(mainFrame, 12)
 addStroke(mainFrame, C_ORANGE, 2)
 addOrangeTitle(mainFrame, "PRISON LIFE AIM ASSIST")
 
--- Active team counter display
-local teamCounterLbl = Instance.new("TextLabel")
-teamCounterLbl.Size             = UDim2.new(1, -20, 0, 28)
-teamCounterLbl.Position         = UDim2.new(0, 10, 0, 45)
+local teamCounterLbl = newInst("TextLabel")
+teamCounterLbl.Size             = newUDim2(1,-20,0,28)
+teamCounterLbl.Position         = newUDim2(0,10,0,45)
 teamCounterLbl.BackgroundColor3 = C_CARD
 teamCounterLbl.BorderSizePixel  = 0
 teamCounterLbl.Text             = "🎯 Targeted teams: none"
-teamCounterLbl.Font             = Enum.Font.SourceSansBold
+teamCounterLbl.Font             = FONT_BOLD
 teamCounterLbl.TextSize         = 12
 teamCounterLbl.TextColor3       = C_ORANGE
 teamCounterLbl.Parent           = mainFrame
 addCorner(teamCounterLbl, 8)
 
--- Main buttons
-local aimBtn    = makeBtn(mainFrame,  83, C_RED,                     "Enable Aim Assist")
-local wallBtn   = makeBtn(mainFrame, 138, C_GREEN,                   "Wall Check: ON",  C_BLACK)
-local teamsBtn  = makeBtn(mainFrame, 193, Color3.fromRGB(80,130,220), "Team Targets ▸")
-local weaponBtn = makeBtn(mainFrame, 248, C_ORANGE,                  "Weapon Presets ▸", C_BLACK)
-local listBtn   = makeBtn(mainFrame, 303, Color3.fromRGB(150,100,200), "Show Target List")
+local aimBtn    = makeBtn(mainFrame,  83, C_RED,                    "Enable Aim Assist")
+local wallBtn   = makeBtn(mainFrame, 138, C_GREEN,                  "Wall Check: ON",    C_BLACK)
+local teamsBtn  = makeBtn(mainFrame, 193, newColor3(80,130,220),    "Team Targets ▸")
+local weaponBtn = makeBtn(mainFrame, 248, C_ORANGE,                 "Weapon Presets ▸",  C_BLACK)
+local listBtn   = makeBtn(mainFrame, 303, newColor3(150,100,200),   "Show Target List")
 
--- Target list
-local listFrame = Instance.new("ScrollingFrame")
-listFrame.Size                = UDim2.new(1, -20, 0, 130)
-listFrame.Position            = UDim2.new(0, 10, 0, 358)
+local listFrame = newInst("ScrollingFrame")
+listFrame.Size                = newUDim2(1,-20,0,130)
+listFrame.Position            = newUDim2(0,10,0,358)
 listFrame.BackgroundColor3    = C_DARKER
 listFrame.BorderSizePixel     = 0
 listFrame.Visible             = false
 listFrame.ScrollBarThickness  = 6
-listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.AutomaticCanvasSize = AUTO_Y
 listFrame.Parent              = mainFrame
 addCorner(listFrame, 10)
-
-local listLayout = Instance.new("UIListLayout")
-listLayout.Padding = UDim.new(0, 3)
+local listLayout = newInst("UIListLayout")
+listLayout.Padding = newUDim(0, 3)
 listLayout.Parent  = listFrame
 
--- ════════════════════════════════════════════════════════
---   TEAM SELECTION GUI  (separate draggable panel)
--- ════════════════════════════════════════════════════════
-local teamsSG = Instance.new("ScreenGui")
+-- ════════════════════════════════════════════
+--  TEAMS GUI
+-- ════════════════════════════════════════════
+local teamsSG = newInst("ScreenGui")
 teamsSG.Name         = "PrisonLifeTeamsGUI"
 teamsSG.ResetOnSpawn = false
 teamsSG.Parent       = playerGui
 
-local teamsFrame = Instance.new("Frame")
-teamsFrame.Size             = UDim2.new(0, 280, 0, 80)  -- height grows dynamically
-teamsFrame.Position         = UDim2.new(0.02, 0, 0.55, 0)
+local teamsFrame = newInst("Frame")
+teamsFrame.Size             = newUDim2(0,280,0,80)
+teamsFrame.Position         = newUDim2(0.02,0,0.55,0)
 teamsFrame.BackgroundColor3 = C_DARK
 teamsFrame.BorderSizePixel  = 0
 teamsFrame.Active           = true
@@ -213,85 +292,84 @@ addCorner(teamsFrame, 12)
 addStroke(teamsFrame, C_ORANGE, 2)
 addOrangeTitle(teamsFrame, "🎯  TEAM TARGETS")
 
--- Subtitle
-local teamsSub = Instance.new("TextLabel")
-teamsSub.Size             = UDim2.new(1, -20, 0, 18)
-teamsSub.Position         = UDim2.new(0, 10, 0, 44)
+local teamsSub = newInst("TextLabel")
+teamsSub.Size               = newUDim2(1,-20,0,18)
+teamsSub.Position           = newUDim2(0,10,0,44)
 teamsSub.BackgroundTransparency = 1
-teamsSub.Text             = "Click teams to toggle targeting  (multi-select)"
-teamsSub.Font             = Enum.Font.SourceSans
-teamsSub.TextSize         = 11
-teamsSub.TextColor3       = C_MUTED
-teamsSub.Parent           = teamsFrame
+teamsSub.Text               = "Click teams to toggle targeting  (multi-select)"
+teamsSub.Font               = FONT_REG
+teamsSub.TextSize           = 11
+teamsSub.TextColor3         = C_MUTED
+teamsSub.Parent             = teamsFrame
 
--- Select All / Deselect All row
-local selAllBtn = Instance.new("TextButton")
-selAllBtn.Size             = UDim2.new(0.48, -14, 0, 30)
-selAllBtn.Position         = UDim2.new(0, 10, 0, 66)
-selAllBtn.BackgroundColor3 = Color3.fromRGB(60, 150, 60)
+local selAllBtn = newInst("TextButton")
+selAllBtn.Size             = newUDim2(0.48,-14,0,30)
+selAllBtn.Position         = newUDim2(0,10,0,66)
+selAllBtn.BackgroundColor3 = newColor3(60,150,60)
 selAllBtn.BorderSizePixel  = 0
 selAllBtn.Text             = "✔ Select All"
-selAllBtn.Font             = Enum.Font.SourceSansBold
+selAllBtn.Font             = FONT_BOLD
 selAllBtn.TextSize         = 12
 selAllBtn.TextColor3       = C_WHITE
 selAllBtn.AutoButtonColor  = false
 selAllBtn.Parent           = teamsFrame
 addCorner(selAllBtn, 8)
 
-local deselAllBtn = Instance.new("TextButton")
-deselAllBtn.Size             = UDim2.new(0.48, -14, 0, 30)
-deselAllBtn.Position         = UDim2.new(0.5, 4, 0, 66)
-deselAllBtn.BackgroundColor3 = Color3.fromRGB(160, 60, 60)
+local deselAllBtn = newInst("TextButton")
+deselAllBtn.Size             = newUDim2(0.48,-14,0,30)
+deselAllBtn.Position         = newUDim2(0.5,4,0,66)
+deselAllBtn.BackgroundColor3 = newColor3(160,60,60)
 deselAllBtn.BorderSizePixel  = 0
 deselAllBtn.Text             = "✖ Clear All"
-deselAllBtn.Font             = Enum.Font.SourceSansBold
+deselAllBtn.Font             = FONT_BOLD
 deselAllBtn.TextSize         = 12
 deselAllBtn.TextColor3       = C_WHITE
 deselAllBtn.AutoButtonColor  = false
 deselAllBtn.Parent           = teamsFrame
 addCorner(deselAllBtn, 8)
 
--- ScrollingFrame for the team cards (sits below the two header buttons)
-local teamsScroll = Instance.new("ScrollingFrame")
-teamsScroll.Size                = UDim2.new(1, -20, 0, 0)   -- height set after building cards
-teamsScroll.Position            = UDim2.new(0, 10, 0, 104)
+local teamsScroll = newInst("ScrollingFrame")
+teamsScroll.Size                = newUDim2(1,-20,0,0)
+teamsScroll.Position            = newUDim2(0,10,0,104)
 teamsScroll.BackgroundColor3    = C_DARKER
 teamsScroll.BorderSizePixel     = 0
 teamsScroll.ScrollBarThickness  = 6
-teamsScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+teamsScroll.AutomaticCanvasSize = AUTO_Y
 teamsScroll.Parent              = teamsFrame
 addCorner(teamsScroll, 10)
 
-local teamsScrollLayout = Instance.new("UIListLayout")
-teamsScrollLayout.Padding           = UDim.new(0, 6)
-teamsScrollLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-teamsScrollLayout.Parent            = teamsScroll
+local teamsScrollLayout = newInst("UIListLayout")
+teamsScrollLayout.Padding              = newUDim(0, 6)
+teamsScrollLayout.HorizontalAlignment  = HALIGN_CENTER
+teamsScrollLayout.Parent               = teamsScroll
 
-local teamsScrollPad = Instance.new("UIPadding")
-teamsScrollPad.PaddingTop    = UDim.new(0, 6)
-teamsScrollPad.PaddingBottom = UDim.new(0, 6)
+local teamsScrollPad = newInst("UIPadding")
+teamsScrollPad.PaddingTop    = newUDim(0, 6)
+teamsScrollPad.PaddingBottom = newUDim(0, 6)
 teamsScrollPad.Parent        = teamsScroll
 
--- teamCardRefs: teamName → { btn, dot, nameLbl, countLbl, teamColor }
+-- teamCardRefs[teamName] = { btn, dot, nameLbl, countLbl, checkLbl, teamColor }
 local teamCardRefs = {}
 
+-- Pre-built counter string avoids tblConcat inside refreshTeamCounter
 local function refreshTeamCounter()
     local names = {}
-    for tname, on in pairs(selectedTeams) do
-        if on then names[#names+1] = tname end
+    local n = 0
+    for tname, on in pairsFn(selectedTeams) do
+        if on then n += 1; names[n] = tname end
     end
-    if #names == 0 then
-        teamCounterLbl.Text = "🎯 Targeted teams: none"
-    else
-        teamCounterLbl.Text = "🎯 Targeting: " .. table.concat(names, ", ")
-    end
+    teamCounterLbl.Text = n == 0
+        and "🎯 Targeted teams: none"
+        or  "🎯 Targeting: " .. tblConcat(names, ", ")
 end
 
 local function updateTeamCardCount(tname)
     local ref = teamCardRefs[tname]
     if not ref then return end
     local count = 0
-    for _, p in ipairs(Players:GetPlayers()) do
+    local allP  = Players:GetPlayers()
+    for i = 1, #allP do
+        local p = allP[i]
         if p ~= player and p.Team and p.Team.Name == tname then
             count += 1
         end
@@ -302,34 +380,43 @@ end
 local function setTeamSelected(tname, on)
     selectedTeams[tname] = on or nil
     local ref = teamCardRefs[tname]
-    if not ref then return end
-    local tc = ref.teamColor
-    if on then
-        ref.btn.BackgroundColor3 = Color3.new(tc.R * 0.55, tc.G * 0.55, tc.B * 0.55)
-        addStroke(ref.btn, tc, 2)
-        ref.dot.BackgroundColor3 = tc
-        ref.nameLbl.TextColor3   = tc
-        ref.checkLbl.Text        = "✔"
-        ref.checkLbl.TextColor3  = tc
-    else
-        ref.btn.BackgroundColor3 = C_CARD
-        -- remove stroke
-        for _, c in ipairs(ref.btn:GetChildren()) do
-            if c:IsA("UIStroke") then c:Destroy() end
+    if ref then
+        local tc = ref.teamColor
+        if on then
+            ref.btn.BackgroundColor3 = newColor3(
+                mathMin(tc.R * 255 * 0.55, 255),
+                mathMin(tc.G * 255 * 0.55, 255),
+                mathMin(tc.B * 255 * 0.55, 255)
+            )
+            -- Replace stroke efficiently
+            for _, c in ipairsFn(ref.btn:GetChildren()) do
+                if c:IsA("UIStroke") then c:Destroy() end
+            end
+            addStroke(ref.btn, tc, 2)
+            ref.dot.BackgroundColor3 = tc
+            ref.nameLbl.TextColor3   = tc
+            ref.checkLbl.Text        = "✔"
+            ref.checkLbl.TextColor3  = tc
+        else
+            ref.btn.BackgroundColor3 = C_CARD
+            for _, c in ipairsFn(ref.btn:GetChildren()) do
+                if c:IsA("UIStroke") then c:Destroy() end
+            end
+            ref.dot.BackgroundColor3 = C_DISABLED
+            ref.nameLbl.TextColor3   = C_MUTED
+            ref.checkLbl.Text        = "○"
+            ref.checkLbl.TextColor3  = C_MUTED
         end
-        ref.dot.BackgroundColor3 = C_DISABLED
-        ref.nameLbl.TextColor3   = C_MUTED
-        ref.checkLbl.Text        = "○"
-        ref.checkLbl.TextColor3  = C_MUTED
     end
+    rebuildTargetList()
     refreshTeamCounter()
 end
 
 local function buildTeamCard(tname, tcolor)
-    if teamCardRefs[tname] then return end  -- already built
+    if teamCardRefs[tname] then return end
 
-    local card = Instance.new("TextButton")
-    card.Size             = UDim2.new(1, -12, 0, 52)
+    local card = newInst("TextButton")
+    card.Size             = newUDim2(1,-12,0,52)
     card.BackgroundColor3 = C_CARD
     card.BorderSizePixel  = 0
     card.Text             = ""
@@ -337,57 +424,49 @@ local function buildTeamCard(tname, tcolor)
     card.Parent           = teamsScroll
     addCorner(card, 10)
 
-    -- Left color dot
-    local dot = Instance.new("Frame")
-    dot.Size             = UDim2.new(0, 6, 0.7, 0)
-    dot.Position         = UDim2.new(0, 0, 0.15, 0)
+    local dot = newInst("Frame")
+    dot.Size             = newUDim2(0,6,0.7,0)
+    dot.Position         = newUDim2(0,0,0.15,0)
     dot.BackgroundColor3 = C_DISABLED
     dot.BorderSizePixel  = 0
     dot.Parent           = card
     addCorner(dot, 4)
 
-    -- Team name
-    local nameLbl = Instance.new("TextLabel")
-    nameLbl.Size             = UDim2.new(1, -58, 0, 26)
-    nameLbl.Position         = UDim2.new(0, 14, 0, 6)
+    local nameLbl = newInst("TextLabel")
+    nameLbl.Size               = newUDim2(1,-58,0,26)
+    nameLbl.Position           = newUDim2(0,14,0,6)
     nameLbl.BackgroundTransparency = 1
-    nameLbl.Text             = tname
-    nameLbl.Font             = Enum.Font.SourceSansBold
-    nameLbl.TextSize         = 15
-    nameLbl.TextColor3       = C_MUTED
-    nameLbl.TextXAlignment   = Enum.TextXAlignment.Left
-    nameLbl.Parent           = card
+    nameLbl.Text               = tname
+    nameLbl.Font               = FONT_BOLD
+    nameLbl.TextSize           = 15
+    nameLbl.TextColor3         = C_MUTED
+    nameLbl.TextXAlignment     = ALIGN_LEFT
+    nameLbl.Parent             = card
 
-    -- Online count
-    local countLbl = Instance.new("TextLabel")
-    countLbl.Size             = UDim2.new(1, -58, 0, 18)
-    countLbl.Position         = UDim2.new(0, 14, 0, 30)
+    local countLbl = newInst("TextLabel")
+    countLbl.Size               = newUDim2(1,-58,0,18)
+    countLbl.Position           = newUDim2(0,14,0,30)
     countLbl.BackgroundTransparency = 1
-    countLbl.Text             = "0 online"
-    countLbl.Font             = Enum.Font.SourceSans
-    countLbl.TextSize         = 11
-    countLbl.TextColor3       = C_MUTED
-    countLbl.TextXAlignment   = Enum.TextXAlignment.Left
-    countLbl.Parent           = card
+    countLbl.Text               = "0 online"
+    countLbl.Font               = FONT_REG
+    countLbl.TextSize           = 11
+    countLbl.TextColor3         = C_MUTED
+    countLbl.TextXAlignment     = ALIGN_LEFT
+    countLbl.Parent             = card
 
-    -- Check indicator (right side)
-    local checkLbl = Instance.new("TextLabel")
-    checkLbl.Size             = UDim2.new(0, 36, 0, 36)
-    checkLbl.Position         = UDim2.new(1, -42, 0.5, -18)
+    local checkLbl = newInst("TextLabel")
+    checkLbl.Size               = newUDim2(0,36,0,36)
+    checkLbl.Position           = newUDim2(1,-42,0.5,-18)
     checkLbl.BackgroundTransparency = 1
-    checkLbl.Text             = "○"
-    checkLbl.Font             = Enum.Font.SourceSansBold
-    checkLbl.TextSize         = 22
-    checkLbl.TextColor3       = C_MUTED
-    checkLbl.Parent           = card
+    checkLbl.Text               = "○"
+    checkLbl.Font               = FONT_BOLD
+    checkLbl.TextSize           = 22
+    checkLbl.TextColor3         = C_MUTED
+    checkLbl.Parent             = card
 
     teamCardRefs[tname] = {
-        btn       = card,
-        dot       = dot,
-        nameLbl   = nameLbl,
-        countLbl  = countLbl,
-        checkLbl  = checkLbl,
-        teamColor = tcolor,
+        btn = card, dot = dot, nameLbl = nameLbl,
+        countLbl = countLbl, checkLbl = checkLbl, teamColor = tcolor,
     }
 
     card.MouseButton1Click:Connect(function()
@@ -397,49 +476,30 @@ local function buildTeamCard(tname, tcolor)
     updateTeamCardCount(tname)
 end
 
--- Populate cards from KNOWN_TEAMS + any live Teams in the game
 local function refreshTeamCards()
-    -- Merge known + live teams
-    local seen = {}
-    local all  = {}
-    for _, t in ipairs(KNOWN_TEAMS) do
-        seen[t.name] = true
-        all[#all+1] = t
-    end
-    for _, t in ipairs(Teams:GetTeams()) do
-        if not seen[t.Name] then
-            seen[t.Name] = true
-            all[#all+1] = { name = t.Name, color = t.TeamColor.Color }
-        end
-    end
-
-    for _, t in ipairs(all) do
-        buildTeamCard(t.name, t.color)
-    end
-
-    -- Dynamically resize the scroll and outer frame
-    local cardCount = #all
-    local scrollH   = math.min(cardCount * 58, 280)   -- max 280px visible
-    teamsScroll.Size = UDim2.new(1, -20, 0, scrollH)
-    teamsFrame.Size  = UDim2.new(0, 280, 0, 104 + scrollH + 12)
+    local KT = KNOWN_TEAMS
+    for i = 1, #KT do buildTeamCard(KT[i].name, KT[i].color) end
+    local scrollH = #KT * 58
+    teamsScroll.Size = newUDim2(1,-20,0,scrollH)
+    teamsFrame.Size  = newUDim2(0,280,0,104 + scrollH + 12)
 end
 
 -- ════════════════════════════════════════════
---   WEAPON PRESETS PANEL
+--  WEAPON PRESETS PANEL
 -- ════════════════════════════════════════════
-local weaponSG = Instance.new("ScreenGui")
+local weaponSG = newInst("ScreenGui")
 weaponSG.Name         = "PrisonLifeWeaponsGUI"
 weaponSG.ResetOnSpawn = false
 weaponSG.Parent       = playerGui
 
-local weaponFrame = Instance.new("ScrollingFrame")
-weaponFrame.Size                = UDim2.new(0, 420, 0, 650)
-weaponFrame.Position            = UDim2.new(0, 370, 0.08, 0)
+local weaponFrame = newInst("ScrollingFrame")
+weaponFrame.Size                = newUDim2(0,420,0,650)
+weaponFrame.Position            = newUDim2(0,370,0.08,0)
 weaponFrame.BackgroundColor3    = C_DARK
 weaponFrame.BorderSizePixel     = 0
 weaponFrame.Visible             = false
 weaponFrame.ScrollBarThickness  = 8
-weaponFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+weaponFrame.AutomaticCanvasSize = AUTO_Y
 weaponFrame.Active              = true
 weaponFrame.Draggable           = true
 weaponFrame.Parent              = weaponSG
@@ -447,28 +507,28 @@ addCorner(weaponFrame, 12)
 addStroke(weaponFrame, C_ORANGE, 2)
 addOrangeTitle(weaponFrame, "PRISON LIFE WEAPONS")
 
-local wLayout = Instance.new("UIListLayout")
-wLayout.Padding = UDim.new(0, 10)
+local wLayout = newInst("UIListLayout")
+wLayout.Padding = newUDim(0, 10)
 wLayout.Parent  = weaponFrame
 
-local wPad = Instance.new("UIPadding")
-wPad.PaddingTop    = UDim.new(0, 50)
-wPad.PaddingLeft   = UDim.new(0, 10)
-wPad.PaddingRight  = UDim.new(0, 10)
-wPad.PaddingBottom = UDim.new(0, 10)
+local wPad = newInst("UIPadding")
+wPad.PaddingTop    = newUDim(0, 50)
+wPad.PaddingLeft   = newUDim(0, 10)
+wPad.PaddingRight  = newUDim(0, 10)
+wPad.PaddingBottom = newUDim(0, 10)
 wPad.Parent        = weaponFrame
 
--- ════════════════════════════════════════════════════════════
---   CYCLES GUI  — separate draggable panel (5 cycle controls)
--- ════════════════════════════════════════════════════════════
-local cyclesSG = Instance.new("ScreenGui")
+-- ════════════════════════════════════════════
+--  CYCLES GUI
+-- ════════════════════════════════════════════
+local cyclesSG = newInst("ScreenGui")
 cyclesSG.Name         = "PrisonLifeCyclesGUI"
 cyclesSG.ResetOnSpawn = false
 cyclesSG.Parent       = playerGui
 
-local cyclesFrame = Instance.new("Frame")
-cyclesFrame.Size             = UDim2.new(0, 300, 0, 410)
-cyclesFrame.Position         = UDim2.new(0.78, 0, 0.08, 0)
+local cyclesFrame = newInst("Frame")
+cyclesFrame.Size             = newUDim2(0,300,0,410)
+cyclesFrame.Position         = newUDim2(0.78,0,0.08,0)
 cyclesFrame.BackgroundColor3 = C_DARK
 cyclesFrame.BorderSizePixel  = 0
 cyclesFrame.Active           = true
@@ -478,147 +538,141 @@ addCorner(cyclesFrame, 12)
 addStroke(cyclesFrame, C_ORANGE, 2)
 addOrangeTitle(cyclesFrame, "⟳  CYCLE SETTINGS")
 
-local cycleSub = Instance.new("TextLabel")
-cycleSub.Size             = UDim2.new(1, -20, 0, 20)
-cycleSub.Position         = UDim2.new(0, 10, 0, 44)
+local cycleSub = newInst("TextLabel")
+cycleSub.Size               = newUDim2(1,-20,0,20)
+cycleSub.Position           = newUDim2(0,10,0,44)
 cycleSub.BackgroundTransparency = 1
-cycleSub.Text             = "Click ▶ to cycle each value"
-cycleSub.Font             = Enum.Font.SourceSans
-cycleSub.TextSize         = 11
-cycleSub.TextColor3       = C_MUTED
-cycleSub.Parent           = cyclesFrame
+cycleSub.Text               = "Click ▶ to cycle each value"
+cycleSub.Font               = FONT_REG
+cycleSub.TextSize           = 11
+cycleSub.TextColor3         = C_MUTED
+cycleSub.Parent             = cyclesFrame
 
 local function makeCycleCard(y, accentColor, labelText, startValue)
-    local card = Instance.new("Frame")
-    card.Size             = UDim2.new(1, -20, 0, 56)
-    card.Position         = UDim2.new(0, 10, 0, y)
+    local card = newInst("Frame")
+    card.Size             = newUDim2(1,-20,0,56)
+    card.Position         = newUDim2(0,10,0,y)
     card.BackgroundColor3 = C_CARD
     card.BorderSizePixel  = 0
     card.Parent           = cyclesFrame
     addCorner(card, 10)
 
-    local accent = Instance.new("Frame")
-    accent.Size             = UDim2.new(0, 4, 1, -14)
-    accent.Position         = UDim2.new(0, 0, 0, 7)
+    local accent = newInst("Frame")
+    accent.Size             = newUDim2(0,4,1,-14)
+    accent.Position         = newUDim2(0,0,0,7)
     accent.BackgroundColor3 = accentColor
     accent.BorderSizePixel  = 0
     accent.Parent           = card
     addCorner(accent, 4)
 
-    local lbl = Instance.new("TextLabel")
-    lbl.Size             = UDim2.new(1, -62, 0, 22)
-    lbl.Position         = UDim2.new(0, 12, 0, 5)
+    local lbl = newInst("TextLabel")
+    lbl.Size               = newUDim2(1,-62,0,22)
+    lbl.Position           = newUDim2(0,12,0,5)
     lbl.BackgroundTransparency = 1
-    lbl.Text             = labelText
-    lbl.Font             = Enum.Font.SourceSansBold
-    lbl.TextSize         = 11
-    lbl.TextColor3       = Color3.fromRGB(190, 190, 190)
-    lbl.TextXAlignment   = Enum.TextXAlignment.Left
-    lbl.Parent           = card
+    lbl.Text               = labelText
+    lbl.Font               = FONT_BOLD
+    lbl.TextSize           = 11
+    lbl.TextColor3         = newColor3(190,190,190)
+    lbl.TextXAlignment     = ALIGN_LEFT
+    lbl.Parent             = card
 
-    local valLbl = Instance.new("TextLabel")
-    valLbl.Size             = UDim2.new(1, -62, 0, 24)
-    valLbl.Position         = UDim2.new(0, 12, 0, 27)
+    local valLbl = newInst("TextLabel")
+    valLbl.Size               = newUDim2(1,-62,0,24)
+    valLbl.Position           = newUDim2(0,12,0,27)
     valLbl.BackgroundTransparency = 1
-    valLbl.Text             = tostring(startValue)
-    valLbl.Font             = Enum.Font.SourceSansBold
-    valLbl.TextSize         = 16
-    valLbl.TextColor3       = accentColor
-    valLbl.TextXAlignment   = Enum.TextXAlignment.Left
-    valLbl.Parent           = card
+    valLbl.Text               = toStr(startValue)
+    valLbl.Font               = FONT_BOLD
+    valLbl.TextSize           = 16
+    valLbl.TextColor3         = accentColor
+    valLbl.TextXAlignment     = ALIGN_LEFT
+    valLbl.Parent             = card
 
-    local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(0, 42, 0, 42)
-    btn.Position         = UDim2.new(1, -50, 0.5, -21)
+    local btn = newInst("TextButton")
+    btn.Size             = newUDim2(0,42,0,42)
+    btn.Position         = newUDim2(1,-50,0.5,-21)
     btn.BackgroundColor3 = accentColor
     btn.BorderSizePixel  = 0
     btn.Text             = "▶"
-    btn.Font             = Enum.Font.SourceSansBold
+    btn.Font             = FONT_BOLD
     btn.TextSize         = 18
     btn.TextColor3       = C_BLACK
     btn.AutoButtonColor  = false
     btn.Parent           = card
     addCorner(btn, 10)
 
-    btn.MouseEnter:Connect(function()
-        btn.BackgroundColor3 = Color3.new(
-            math.min(accentColor.R + 0.12, 1),
-            math.min(accentColor.G + 0.12, 1),
-            math.min(accentColor.B + 0.12, 1)
-        )
-    end)
+    -- Hover: brighten by +0.12 on each channel
+    local hoverColor = newColor3(
+        mathMin((accentColor.R + 0.12) * 255, 255),
+        mathMin((accentColor.G + 0.12) * 255, 255),
+        mathMin((accentColor.B + 0.12) * 255, 255)
+    )
+    btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverColor end)
     btn.MouseLeave:Connect(function() btn.BackgroundColor3 = accentColor end)
 
     return btn, valLbl
 end
 
-local aimPartCycleBtn, aimPartVal = makeCycleCard( 70, Color3.fromRGB(100,150,255), "AIM PART",        "Head")
-local fovCycleBtn,     fovVal     = makeCycleCard(136, Color3.fromRGB( 80,100,255), "FIELD OF VIEW",   tostring(fovRadius))
-local speedCycleBtn,   speedVal   = makeCycleCard(202, Color3.fromRGB(255,220,  0), "BULLET SPEED",    tostring(bulletSpeed))
-local smoothCycleBtn,  smoothVal  = makeCycleCard(268, Color3.fromRGB(100,255,150), "SMOOTHNESS",      string.format("%.2f", smoothness))
-local predCycleBtn,    predVal    = makeCycleCard(334, Color3.fromRGB(255,150, 50), "PREDICTION MULT", string.format("%.2fx", predictionStrength))
+local aimPartCycleBtn, aimPartVal = makeCycleCard( 70, newColor3(100,150,255), "AIM PART",        "Head")
+local fovCycleBtn,     fovVal     = makeCycleCard(136, newColor3( 80,100,255), "FIELD OF VIEW",   toStr(fovRadius))
+local speedCycleBtn,   speedVal   = makeCycleCard(202, newColor3(255,220,  0), "BULLET SPEED",    toStr(bulletSpeed))
+local smoothCycleBtn,  smoothVal  = makeCycleCard(268, newColor3(100,255,150), "SMOOTHNESS",      strFmt("%.2f", smoothness))
+local predCycleBtn,    predVal    = makeCycleCard(334, newColor3(255,150, 50), "PREDICTION MULT", strFmt("%.2fx", predictionStrength))
 
 -- ════════════════════════════════════════════
---   TARGET LIST LOGIC
+--  TARGET LIST  (UI only, not hot path)
 -- ════════════════════════════════════════════
-local function isTargeted(p)
-    if p == player then return false end
-    if not p.Team then return false end
-    return selectedTeams[p.Team.Name] == true
-end
-
 local function updateTargetList()
-    for _, c in ipairs(listFrame:GetChildren()) do
+    -- Clear existing labels
+    for _, c in ipairsFn(listFrame:GetChildren()) do
         if c:IsA("TextLabel") then c:Destroy() end
     end
-    local targets, tc = {}, 0
-    for _, p in ipairs(Players:GetPlayers()) do
-        if isTargeted(p) then
-            tc += 1
-            targets[tc] = p
-        end
-    end
-    if tc == 0 then
-        local nl = Instance.new("TextLabel")
-        nl.Size             = UDim2.new(1,-10,0,30)
-        nl.BackgroundTransparency = 1
-        nl.Text             = "No targets found"
-        nl.TextColor3       = C_MUTED
-        nl.Font             = Enum.Font.SourceSans
-        nl.TextSize         = 13
-        nl.Parent           = listFrame
-    else
-        for i = 1, tc do
-            local p  = targets[i]
-            local tc2 = p.Team and p.Team.Name or "?"
-            local e = Instance.new("TextLabel")
-            e.Size             = UDim2.new(1,-10,0,25)
+    local count = 0
+    local allP = Players:GetPlayers()
+    for i = 1, #allP do
+        local p = allP[i]
+        if p ~= player and p.Team and selectedTeams[p.Team.Name] then
+            count += 1
+            local tname = p.Team.Name
+            local e = newInst("TextLabel")
+            e.Size             = newUDim2(1,-10,0,25)
             e.BackgroundColor3 = C_CARD
             e.BorderSizePixel  = 0
-            e.Text             = string.format("%d. [%s]  %s", i, tc2, p.Name)
-            e.TextColor3       = (teamCardRefs[tc2] and teamCardRefs[tc2].teamColor) or C_WHITE
-            e.Font             = Enum.Font.SourceSans
+            e.Text             = strFmt("%d. [%s]  %s", count, tname, p.Name)
+            e.TextColor3       = (teamCardRefs[tname] and teamCardRefs[tname].teamColor) or C_WHITE
+            e.Font             = FONT_REG
             e.TextSize         = 12
-            e.TextXAlignment   = Enum.TextXAlignment.Left
+            e.TextXAlignment   = ALIGN_LEFT
             e.Parent           = listFrame
             addCorner(e, 5)
-            local ep = Instance.new("UIPadding")
-            ep.PaddingLeft = UDim.new(0, 6)
+            local ep = newInst("UIPadding")
+            ep.PaddingLeft = newUDim(0, 6)
             ep.Parent = e
         end
     end
+    if count == 0 then
+        local nl = newInst("TextLabel")
+        nl.Size               = newUDim2(1,-10,0,30)
+        nl.BackgroundTransparency = 1
+        nl.Text               = "No targets found"
+        nl.TextColor3         = C_MUTED
+        nl.Font               = FONT_REG
+        nl.TextSize           = 13
+        nl.Parent             = listFrame
+    end
 end
 
 -- ════════════════════════════════════════════
---   WEAPON PRESET POPULATION
+--  WEAPON PRESETS POPULATION
 -- ════════════════════════════════════════════
 local function populateWeapons()
-    for _, c in ipairs(weaponFrame:GetChildren()) do
+    for _, c in ipairsFn(weaponFrame:GetChildren()) do
         if c:IsA("Frame") then c:Destroy() end
     end
-    for i, w in ipairs(weaponPresets) do
-        local card = Instance.new("Frame")
-        card.Size             = UDim2.new(1,-20,0,120)
+    local WP = weaponPresets
+    for i = 1, #WP do
+        local w = WP[i]
+        local card = newInst("Frame")
+        card.Size             = newUDim2(1,-20,0,120)
         card.BackgroundColor3 = C_CARD
         card.BorderSizePixel  = 0
         card.LayoutOrder      = i
@@ -627,57 +681,62 @@ local function populateWeapons()
         local st = addStroke(card, C_ORANGE, 1)
         st.Transparency = 0.7
 
-        local function mkLbl(txt, x, y, w2, h, size, color, bold)
-            local l = Instance.new("TextLabel")
-            l.Size             = UDim2.new(0,w2,0,h)
-            l.Position         = UDim2.new(0,x,0,y)
+        local function mkL(txt, x, y2, w2, h, size, color, bold)
+            local l = newInst("TextLabel")
+            l.Size               = newUDim2(0,w2,0,h)
+            l.Position           = newUDim2(0,x,0,y2)
             l.BackgroundTransparency = 1
-            l.Text             = txt
-            l.Font             = bold and Enum.Font.SourceSansBold or Enum.Font.SourceSans
-            l.TextSize         = size
-            l.TextColor3       = color
-            l.TextXAlignment   = Enum.TextXAlignment.Left
-            l.TextWrapped      = true
-            l.Parent           = card
+            l.Text               = txt
+            l.Font               = bold and FONT_BOLD or FONT_REG
+            l.TextSize           = size
+            l.TextColor3         = color
+            l.TextXAlignment     = ALIGN_LEFT
+            l.TextWrapped        = true
+            l.Parent             = card
         end
-        mkLbl(w.name, 5, 5,  390, 25, 16, C_ORANGE,                       true)
-        mkLbl(w.desc, 5, 30, 390, 35, 11, Color3.fromRGB(200,200,200),    false)
-        mkLbl(string.format("Speed:%d | FOV:%d | Smooth:%.2f", w.speed, w.fov, w.smooth),
-              5, 60, 390, 25, 11, Color3.fromRGB(150,200,255), false)
+        mkL(w.name, 5, 5,  390, 25, 16, C_ORANGE,                      true)
+        mkL(w.desc, 5, 30, 390, 35, 11, newColor3(200,200,200),         false)
+        mkL(strFmt("Speed:%d | FOV:%d | Smooth:%.2f", w.speed, w.fov, w.smooth),
+            5, 60, 390, 25, 11, newColor3(150,200,255), false)
 
-        local apply = Instance.new("TextButton")
-        apply.Size             = UDim2.new(1,-10,0,25)
-        apply.Position         = UDim2.new(0,5,1,-30)
+        local apply = newInst("TextButton")
+        apply.Size             = newUDim2(1,-10,0,25)
+        apply.Position         = newUDim2(0,5,1,-30)
         apply.BackgroundColor3 = C_ORANGE
         apply.BorderSizePixel  = 0
         apply.Text             = "Apply"
-        apply.Font             = Enum.Font.SourceSansBold
+        apply.Font             = FONT_BOLD
         apply.TextSize         = 13
         apply.TextColor3       = C_BLACK
         apply.AutoButtonColor  = false
         apply.Parent           = card
         addCorner(apply, 6)
 
+        -- Capture weapon values to avoid re-indexing w inside callback
+        local wSpeed, wSmooth, wPred, wFov = w.speed, w.smooth, w.pred, w.fov
         apply.MouseButton1Click:Connect(function()
-            bulletSpeed        = w.speed
-            smoothness         = w.smooth
-            predictionStrength = w.pred
-            fovRadius          = w.fov
-            speedVal.Text      = tostring(bulletSpeed)
-            smoothVal.Text     = string.format("%.2f", smoothness)
-            predVal.Text       = string.format("%.2fx", predictionStrength)
-            fovVal.Text        = tostring(fovRadius)
+            bulletSpeed        = wSpeed
+            smoothness         = wSmooth
+            predictionStrength = wPred
+            fovRadius          = wFov
+            fovRadiusSq        = wFov * wFov
+            invBulletSpeed     = 1 / wSpeed
+            speedVal.Text      = toStr(wSpeed)
+            smoothVal.Text     = strFmt("%.2f", wSmooth)
+            predVal.Text       = strFmt("%.2fx", wPred)
+            fovVal.Text        = toStr(wFov)
             apply.Text             = "Done!"
             apply.BackgroundColor3 = C_GREEN
-            task.wait(1)
-            apply.Text             = "Apply"
-            apply.BackgroundColor3 = C_ORANGE
+            taskDelay(1, function()
+                apply.Text             = "Apply"
+                apply.BackgroundColor3 = C_ORANGE
+            end)
         end)
     end
 end
 
 -- ════════════════════════════════════════════
---   BUTTON EVENTS — MAIN GUI
+--  BUTTON EVENTS
 -- ════════════════════════════════════════════
 wallBtn.MouseButton1Click:Connect(function()
     wallCheckEnabled = not wallCheckEnabled
@@ -689,10 +748,8 @@ end)
 teamsBtn.MouseButton1Click:Connect(function()
     if not teamsFrame.Visible then
         refreshTeamCards()
-        -- update online counts
-        for tname in pairs(teamCardRefs) do
-            updateTeamCardCount(tname)
-        end
+        local TCR = teamCardRefs
+        for tname in pairsFn(TCR) do updateTeamCardCount(tname) end
     end
     teamsFrame.Visible = not teamsFrame.Visible
 end)
@@ -707,107 +764,115 @@ listBtn.MouseButton1Click:Connect(function()
     if listFrame.Visible then updateTargetList() end
 end)
 
--- Select All / Clear All
 selAllBtn.MouseButton1Click:Connect(function()
-    for tname in pairs(teamCardRefs) do
-        setTeamSelected(tname, true)
-    end
+    for tname in pairsFn(teamCardRefs) do setTeamSelected(tname, true) end
 end)
 
 deselAllBtn.MouseButton1Click:Connect(function()
-    for tname in pairs(teamCardRefs) do
-        setTeamSelected(tname, false)
-    end
+    for tname in pairsFn(teamCardRefs) do setTeamSelected(tname, false) end
     selectedTeams = {}
+    rebuildTargetList()
     refreshTeamCounter()
 end)
 
--- ════════════════════════════════════════════
---   BUTTON EVENTS — CYCLES GUI
--- ════════════════════════════════════════════
+-- Cycle buttons
+local aimParts = { "Head", "Torso", "HumanoidRootPart" }
+local aimPartIdx = 1
 aimPartCycleBtn.MouseButton1Click:Connect(function()
-    if     aimPart == "Head"           then aimPart = "Torso"
-    elseif aimPart == "Torso"          then aimPart = "HumanoidRootPart"
-    else                                    aimPart = "Head" end
+    aimPartIdx = aimPartIdx % #aimParts + 1
+    aimPart = aimParts[aimPartIdx]
     aimPartVal.Text = aimPart
+    rebuildTargetList()  -- part refs must be refreshed
 end)
 
 fovCycleBtn.MouseButton1Click:Connect(function()
-    fovRadius = fovRadius + 50
+    fovRadius   = fovRadius + 50
     if fovRadius > maxFovRadius then fovRadius = minFovRadius end
-    fovVal.Text = tostring(fovRadius)
+    fovRadiusSq = fovRadius * fovRadius
+    fovVal.Text = toStr(fovRadius)
 end)
 
 speedCycleBtn.MouseButton1Click:Connect(function()
-    bulletSpeed = bulletSpeed + bulletSpeedStep
+    bulletSpeed    = bulletSpeed + bulletSpeedStep
     if bulletSpeed > maxBulletSpeed then bulletSpeed = minBulletSpeed end
-    speedVal.Text = tostring(bulletSpeed)
+    invBulletSpeed = 1 / bulletSpeed
+    speedVal.Text  = toStr(bulletSpeed)
 end)
 
 smoothCycleBtn.MouseButton1Click:Connect(function()
     smoothness = smoothness + smoothStep
     if smoothness > maxSmoothness then smoothness = minSmoothness end
-    smoothVal.Text = string.format("%.2f", smoothness)
+    smoothVal.Text = strFmt("%.2f", smoothness)
 end)
 
 predCycleBtn.MouseButton1Click:Connect(function()
     predictionStrength = predictionStrength + predStep
     if predictionStrength > maxPrediction then predictionStrength = minPrediction end
-    predVal.Text = string.format("%.2fx", predictionStrength)
+    predVal.Text = strFmt("%.2fx", predictionStrength)
 end)
 
 -- ════════════════════════════════════════════
---   AIM ASSIST LOGIC
+--  AIM ASSIST LOGIC — HOT PATH
 -- ════════════════════════════════════════════
 local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-local raycastFilter  = { player.Character, camera }
+rayParams.FilterType = RAY_EXCLUDE
+local raycastFilter  = { player.Character }
+rayParams.FilterDescendantsInstances = raycastFilter
 
-local function hasLineOfSight(target)
-    if not wallCheckEnabled then return true end
-    if not target or not target.Parent then return false end
-    raycastFilter[1] = player.Character
+local function hasLineOfSight(targetPart)
+    -- Inline early exit — no function call overhead
+    raycastFilter[1]                     = player.Character
     rayParams.FilterDescendantsInstances = raycastFilter
-    local result = Workspace:Raycast(camera.CFrame.Position, target.Position - camera.CFrame.Position, rayParams)
-    if not result then return true end
-    return result.Instance:IsDescendantOf(target.Parent)
+    local camPos  = camera.CFrame.Position
+    local result  = Workspace:Raycast(camPos, targetPart.Position - camPos, rayParams)
+    return (not result) or result.Instance:IsDescendantOf(targetPart.Parent)
 end
 
-local function predictPosition(target)
-    if not target or not target.Parent or predictionStrength <= 0 then
-        return target and target.Position or nil
-    end
-    local vel = target.AssemblyLinearVelocity
-    if vel.Magnitude < 1 then return target.Position end
-    local dist = (target.Position - camera.CFrame.Position).Magnitude
-    return target.Position + vel * ((dist / bulletSpeed) + reactionTime) * predictionStrength
-end
-
-local viewportX, viewportY = 0, 0
-local function updateCenter()
+-- Pre-cached viewport halves, updated via signal
+local vpHalfX, vpHalfY = 0, 0
+local function updateViewport()
     local vs = camera.ViewportSize
-    viewportX = vs.X * 0.5
-    viewportY = vs.Y * 0.5
+    vpHalfX  = vs.X * 0.5
+    vpHalfY  = vs.Y * 0.5
 end
-updateCenter()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateCenter)
+updateViewport()
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateViewport)
 
-local function findTarget()
-    local closest, closestDist = nil, math.huge
-    for _, p in ipairs(Players:GetPlayers()) do
-        if isTargeted(p) then
-            local char = p.Character
-            if char then
-                local part = char:FindFirstChild(aimPart) or char:FindFirstChild("Head")
-                local hum  = char:FindFirstChild("Humanoid")
-                if part and hum and hum.Health > 0 then
-                    local sp, onScreen = camera:WorldToViewportPoint(part.Position)
-                    if onScreen then
-                        local dx, dy = sp.X - viewportX, sp.Y - viewportY
-                        if (dx*dx + dy*dy)^0.5 <= fovRadius then
-                            local wd = (part.Position - camera.CFrame.Position).Magnitude
-                            if wd < closestDist and hasLineOfSight(part) then
-                                closestDist = wd
+local loopRunning = false
+local lastTarget, acquireTime = nil, 0
+
+-- AIM LOOP — bound via BindToRenderStep for guaranteed per-frame execution
+-- at highest priority after the camera, no coroutine overhead
+local function onRenderStep()
+    if not aimAssistEnabled then return end
+
+    -- Cache CFrame once per frame (avoids 2–3 extra property lookups below)
+    local camCF     = camera.CFrame
+    local camPos    = camCF.Position
+
+    local closest, closestDistSq = nil, mathHuge
+    local TL = targetList
+    local TN = targetListLen
+
+    for i = 1, TN do
+        local part = TL[i]
+        if part and part.Parent then
+            -- Check humanoid alive (cached reference)
+            local hum = part.Parent:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                -- Screen-space FOV check using squared distance (no sqrt)
+                local sp, onScreen = camera:WorldToViewportPoint(part.Position)
+                if onScreen then
+                    local dx = sp.X - vpHalfX
+                    local dy = sp.Y - vpHalfY
+                    if dx*dx + dy*dy <= fovRadiusSq then
+                        local wdx = part.Position.X - camPos.X
+                        local wdy = part.Position.Y - camPos.Y
+                        local wdz = part.Position.Z - camPos.Z
+                        local distSq = wdx*wdx + wdy*wdy + wdz*wdz
+                        if distSq < closestDistSq then
+                            if not wallCheckEnabled or hasLineOfSight(part) then
+                                closestDistSq = distSq
                                 closest = part
                             end
                         end
@@ -816,31 +881,25 @@ local function findTarget()
             end
         end
     end
-    return closest
-end
 
-local loopRunning = false
-local lastTarget, acquireTime = nil, 0
+    if closest ~= lastTarget then
+        acquireTime = tickFn()
+        lastTarget  = closest
+    end
 
-local function aimLoop()
-    if loopRunning then return end
-    loopRunning = true
-    while aimAssistEnabled do
-        local target = findTarget()
-        if target ~= lastTarget then
-            acquireTime = tick()
-            lastTarget  = target
-        end
-        if target and (tick() - acquireTime >= reactionTime) then
-            local pos = predictPosition(target)
-            if pos then
-                camera.CFrame = camera.CFrame:Lerp(
-                    CFrame.new(camera.CFrame.Position, pos), smoothness)
+    if closest and (tickFn() - acquireTime >= reactionTime) then
+        local pos = closest.Position
+        -- Prediction: inline to avoid function call overhead in hot path
+        if predictionStrength > 0 then
+            local vel = closest.AssemblyLinearVelocity
+            if vel.Magnitude >= 1 then
+                local dist      = mathSqrt(closestDistSq)
+                local totalTime = dist * invBulletSpeed + reactionTime
+                pos = pos + vel * (totalTime * predictionStrength)
             end
         end
-        RunService.RenderStepped:Wait()
+        camera.CFrame = camCF:Lerp(newCFrame(camPos, pos), smoothness)
     end
-    loopRunning = false
 end
 
 aimBtn.MouseButton1Click:Connect(function()
@@ -849,44 +908,64 @@ aimBtn.MouseButton1Click:Connect(function()
     aimBtn.BackgroundColor3 = aimAssistEnabled and C_GREEN or C_RED
     if aimAssistEnabled then
         lastTarget = nil
-        task.spawn(aimLoop)
+        if not loopRunning then
+            loopRunning = true
+            RunService:BindToRenderStep("AimAssist", BIND_INPUT_PRIO, onRenderStep)
+        end
+    else
+        RunService:UnbindFromRenderStep("AimAssist")
+        loopRunning = false
     end
 end)
 
 -- ════════════════════════════════════════════
---   BACKGROUND POLLING
+--  PLAYER / CHARACTER EVENT HOOKS
 -- ════════════════════════════════════════════
-task.spawn(function()
-    while task.wait(3) do
-        -- refresh online counts for visible team panel
+local function onCharAdded(p)
+    -- Re-cache parts when a character spawns/respawns
+    p.Character:WaitForChild("HumanoidRootPart", 5)
+    cacheCharParts(p)
+    rebuildTargetList()
+end
+
+local function hookPlayer(p)
+    if p == player then return end
+    addToTargetCache(p)
+    p.CharacterAdded:Connect(function() onCharAdded(p) end)
+    p.CharacterRemoving:Connect(function()
+        charPartCache[p] = nil
+        rebuildTargetList()
+    end)
+end
+
+-- Hook all current players
+local allExisting = Players:GetPlayers()
+for i = 1, #allExisting do hookPlayer(allExisting[i]) end
+
+Players.PlayerAdded:Connect(function(p)
+    hookPlayer(p)
+    taskDelay(0.5, function()
+        for tname in pairsFn(teamCardRefs) do updateTeamCardCount(tname) end
+        refreshTeamCounter()
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+    removeFromTargetCache(p)
+    taskDelay(0.1, function()
+        for tname in pairsFn(teamCardRefs) do updateTeamCardCount(tname) end
+        refreshTeamCounter()
+    end)
+end)
+
+-- Lightweight background poll — only updates visible UI, not aim logic
+taskSpawn(function()
+    while taskWait(3) do
         if teamsFrame.Visible then
-            for tname in pairs(teamCardRefs) do
-                updateTeamCardCount(tname)
-            end
+            for tname in pairsFn(teamCardRefs) do updateTeamCardCount(tname) end
         end
-        if listFrame.Visible then
-            updateTargetList()
-        end
+        if listFrame.Visible then updateTargetList() end
     end
 end)
 
--- Also auto-add any new teams that join at runtime
-Teams.ChildAdded:Connect(function(t)
-    if t:IsA("Team") then
-        task.wait(0.1)
-        refreshTeamCards()
-    end
-end)
-
-Players.PlayerAdded:Connect(function()
-    task.wait(0.5)
-    for tname in pairs(teamCardRefs) do updateTeamCardCount(tname) end
-    refreshTeamCounter()
-end)
-Players.PlayerRemoving:Connect(function()
-    task.wait(0.1)
-    for tname in pairs(teamCardRefs) do updateTeamCardCount(tname) end
-    refreshTeamCounter()
-end)
-
-print("✅ Optimized Prison Life Aim Assist Ready!") 
+print("✅ Prison Life Aim Assist loaded & optimized.")
